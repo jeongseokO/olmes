@@ -1400,9 +1400,17 @@ class HFLM_Verbose(HFLM):
                 # max len for inputs = encoder's whole max_length
                 max_ctx_len = self.max_length
 
+            has_prompt_messages = any(pm is not None for pm in all_prompt_messages)
+            has_structured_prompt_segments = any(seg is not None for seg in all_structured_prompt_segments)
             plain_structured_needed = [
-                _needs_plain_prompt_structured_segments(self.model, context, kwargs)
-                for context in contexts
+                False
+                if prompt_messages_arg is not None or structured_prompt_segments_arg is not None
+                else _needs_plain_prompt_structured_segments(self.model, context, kwargs)
+                for context, prompt_messages_arg, structured_prompt_segments_arg in zip(
+                    contexts,
+                    all_prompt_messages,
+                    all_structured_prompt_segments,
+                )
             ]
             if len(contexts) == 1 and plain_structured_needed[0]:
                 structured_segments = _build_plain_prompt_structured_segments(
@@ -1422,8 +1430,6 @@ class HFLM_Verbose(HFLM):
                         "falling back to model.generate() for that request."
                     )
                     self._warned_failed_plain_prompt_structured_segments = True
-            has_prompt_messages = any(pm is not None for pm in all_prompt_messages)
-            has_structured_prompt_segments = any(seg is not None for seg in all_structured_prompt_segments)
             structured_batch_requested = _llopa_v2_batch_runtime_requested(self.model, kwargs)
             structured_serial = len(chunk) != 1 and (
                 has_prompt_messages or has_structured_prompt_segments or any(plain_structured_needed)
