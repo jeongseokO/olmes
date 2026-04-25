@@ -9,6 +9,12 @@ def _model_supports_structured_prompt_generate(model) -> bool:
             return True
         if bool(getattr(candidate, "_unified_llopa_generate_default", False)):
             return True
+        if bool(getattr(candidate, "_llopa_v2_batch_generate_default", False)):
+            return True
+        if bool(getattr(candidate, "_llopa_v2_generate_default", False)):
+            return True
+        if bool(getattr(candidate, "_llopa_v2_vllm_generate_default", False)):
+            return True
         if bool(getattr(candidate, "_direct_llopa_generate_default", False)):
             return True
         if getattr(candidate, "_runtime_prefill_freeze_layers", None) is not None:
@@ -16,6 +22,8 @@ def _model_supports_structured_prompt_generate(model) -> bool:
         if getattr(candidate, "_runtime_prefill_solo_layers", None) is not None:
             return True
         if str(getattr(candidate, "_capsule_inference_path", "") or "") in {
+            "llopa_v2",
+            "llopa_v2_batch",
             "runtime_freeze",
             "runtime_solo",
         }:

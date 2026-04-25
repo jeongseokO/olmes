@@ -16,7 +16,6 @@ from typing import List, Union
 
 import datasets
 import httpx
-from alpaca_eval import evaluate as alpaca_evaluate
 from huggingface_hub import hf_hub_download
 from openai import DefaultHttpxClient
 
@@ -37,6 +36,18 @@ AGGREGATE_METRICS_TO_KEEP = [
     "length_controlled_winrate",
     "lc_standard_error",
 ]
+
+
+def _alpaca_evaluate(**kwargs):
+    try:
+        from alpaca_eval import evaluate as alpaca_evaluate
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "AlpacaEval tasks require the optional 'alpaca_eval' package. "
+            "Install it before running alpaca_eval, styled_alpacaeval, or "
+            "multiturn_alpacaeval tasks."
+        ) from exc
+    return alpaca_evaluate(**kwargs)
 
 
 class AlpacaEval(Task):
@@ -265,7 +276,7 @@ class AlpacaEval(Task):
         # Call the actual evaluation function, using OpenAI API
         if self.annotators_config != "testing":
             self.ensure_annotator_credentials()
-            df_leaderboard, annotations = alpaca_evaluate(
+            df_leaderboard, annotations = _alpaca_evaluate(
                 model_outputs=model_outputs,
                 reference_outputs=reference_outputs,
                 annotators_config=self.annotators_config,

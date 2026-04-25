@@ -8,13 +8,13 @@ from itertools import groupby
 from operator import itemgetter
 from typing import Dict, Optional
 
-from alpaca_eval import evaluate as alpaca_evaluate
 from openai._exceptions import OpenAIError
 
 from oe_eval.data.styled_tasks_perturbations import STYLED_TASKS
 from oe_eval.tasks.oe_eval_tasks.alpaca_eval import (
     AGGREGATE_METRICS_TO_KEEP,
     AlpacaEval,
+    _alpaca_evaluate,
 )
 from oe_eval.utils import get_dict_with_defaults
 
@@ -199,7 +199,7 @@ class GenericStyledAlpacaEval(AlpacaEval):
             RETRIES = self.task_config["metric_kwargs"]["retries"]
             for attempt in range(RETRIES):
                 try:
-                    df_leaderboard, annotations = alpaca_evaluate(
+                    df_leaderboard, annotations = _alpaca_evaluate(
                         model_outputs=model_outputs,
                         reference_outputs=reference_outputs,
                         annotators_config=self.annotators_config,

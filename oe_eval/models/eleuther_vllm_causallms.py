@@ -1,8 +1,11 @@
 import copy
+import importlib.util
 import logging
 import os
+import sys
 from collections import defaultdict
-from typing import DefaultDict, List, Optional, Tuple, cast
+from pathlib import Path
+from typing import Any, DefaultDict, List, Optional, Tuple, cast
 
 import importlib_metadata
 import torch
@@ -35,11 +38,15 @@ def _supports_structured_prompt_generate(model, generation_kwargs=None) -> bool:
             return True
         if bool(generation_kwargs.get("direct_llopa_generate")):
             return True
+        if bool(generation_kwargs.get("llopa_v2_vllm_generate")):
+            return True
     if model is None:
         return False
     if bool(getattr(model, "_structured_llopa_generate_attached", False)):
         return True
     if bool(getattr(model, "_unified_llopa_generate_default", False)):
+        return True
+    if bool(getattr(model, "_llopa_v2_vllm_generate_default", False)):
         return True
     if bool(getattr(model, "_direct_llopa_generate_default", False)):
         return True
@@ -54,6 +61,195 @@ def _strip_structured_prompt_kwargs(model, generation_kwargs):
     for key in removed:
         cleaned.pop(key, None)
     return cleaned, removed
+
+
+LLOPA_V2_VLLM_KEYS = (
+    "llopa_v2_vllm_generate",
+    "llopa_v2_batch_generate",
+    "llopa_v2_generate",
+    "llopa_v2_layers",
+    "llopa_v2_attn",
+    "llopa_v2_system_prefill",
+    "llopa_v2_user_prefill",
+    "llopa_v2_replay_module",
+    "llopa_v2_last_layer_module",
+    "llopa_v2_replay_per_layers",
+    "llopa_v2_no_upper_attn",
+    "llopa_v2_see_past_assistant",
+    "llopa_v2_seed_mode",
+    "force_custom_modeling",
+    "lopa_modeling_path",
+    "modeling_family",
+    "attn_impl",
+    "attn_implementation",
+    "_attn_implementation",
+)
+
+
+def _repo_capsule_dir() -> Path:
+    return Path(__file__).resolve().parents[3] / "Capsule"
+
+
+def _load_capsule_module(module_name: str, filename: str):
+    capsule_dir = _repo_capsule_dir()
+    capsule_dir_s = str(capsule_dir)
+    if capsule_dir_s not in sys.path:
+        sys.path.insert(0, capsule_dir_s)
+    cur_py_path = os.environ.get("PYTHONPATH", "")
+    py_parts = [p for p in cur_py_path.split(":") if p]
+    if capsule_dir_s not in py_parts:
+        os.environ["PYTHONPATH"] = f"{capsule_dir_s}:{cur_py_path}" if cur_py_path else capsule_dir_s
+
+    try:
+        return __import__(module_name, fromlist=["*"])
+    except Exception:
+        module_path = capsule_dir / filename
+        spec = importlib.util.spec_from_file_location(module_name, str(module_path))
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Failed to load {module_name} from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+
+def _normalize_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _configure_llopa_v2_vllm(kwargs: dict) -> dict[str, Any] | None:
+    if not _normalize_bool(kwargs.get("llopa_v2_vllm_generate", False)):
+        return None
+
+    llopa_config = {
+        "layers": int(kwargs.get("llopa_v2_layers") or 0),
+        "attn": str(kwargs.get("llopa_v2_attn") or "causal").strip().lower(),
+        "system_prefill": str(kwargs.get("llopa_v2_system_prefill") or "full").strip().lower(),
+        "user_prefill": str(kwargs.get("llopa_v2_user_prefill") or "full").strip().lower(),
+        "see_past_assistant": _normalize_bool(kwargs.get("llopa_v2_see_past_assistant", False)),
+        "modeling_family": str(kwargs.get("modeling_family") or "llama").strip().lower(),
+    }
+    if llopa_config["attn"] == "prefix_full":
+        llopa_config["attn"] = "full"
+    if llopa_config["attn"] != "causal":
+        raise ValueError("llopa_v2_vllm_generate currently supports only llopa_v2_attn='causal'.")
+    if llopa_config["user_prefill"] != "full":
+        raise ValueError("llopa_v2_vllm_generate currently supports only llopa_v2_user_prefill='full'.")
+    if _normalize_bool(kwargs.get("llopa_v2_no_upper_attn", False)):
+        raise ValueError("llopa_v2_vllm_generate does not support llopa_v2_no_upper_attn=True.")
+    replay_module = str(kwargs.get("llopa_v2_replay_module") or "none").strip().lower()
+    if replay_module and replay_module != "none":
+        raise ValueError("llopa_v2_vllm_generate does not support replay modules.")
+    if llopa_config["layers"] <= 0:
+        raise ValueError("llopa_v2_vllm_generate requires llopa_v2_layers > 0.")
+
+    plugin = _load_capsule_module("vllm_llopa_plugin", "vllm_llopa_plugin.py")
+    plugin.register()
+    if hasattr(plugin, "patch_runtime"):
+        plugin.patch_runtime()
+    arch = plugin.select_architecture(llopa_config["modeling_family"], "auto")
+    if not arch:
+        arch = "LLOPALlamaForCausalLM"
+    kwargs.setdefault("hf_overrides", {"architectures": [arch]})
+    return llopa_config
+
+
+def _load_structured_prompt_builder():
+    mod = _load_capsule_module(
+        "llopa_utils.structured_prompt",
+        "llopa_utils/structured_prompt.py",
+    )
+    return mod.build_structured_prompt_segments
+
+
+def _tensor_len(value: Any) -> int:
+    if isinstance(value, torch.Tensor) and value.dim() >= 2:
+        return int(value.size(1))
+    return 0
+
+
+def _build_llopa_ctx_from_prompt_metadata(
+    tokenizer,
+    *,
+    prompt_messages,
+    prompt_add_generation_prompt,
+    structured_prompt_segments,
+    llopa_config: dict[str, Any],
+) -> dict[str, Any] | None:
+    segments = structured_prompt_segments if isinstance(structured_prompt_segments, dict) else None
+    if segments is None:
+        if prompt_messages is None:
+            return None
+        builder = _load_structured_prompt_builder()
+        segments = builder(
+            tokenizer,
+            prompt_messages,
+            prompt_add_generation_prompt=bool(prompt_add_generation_prompt),
+            device="cpu",
+        )
+
+    system_len = _tensor_len(segments.get("system_ids"))
+    prefix_len = _tensor_len(segments.get("prefix_ids"))
+    prompt_len = _tensor_len(segments.get("prompt_ids"))
+    if prompt_len <= 0:
+        prompt_len = prefix_len + _tensor_len(segments.get("assistant_prefill_ids"))
+    if prefix_len <= 0:
+        prefix_len = max(0, prompt_len - _tensor_len(segments.get("assistant_prefill_ids")))
+
+    system_prefill = str(llopa_config.get("system_prefill") or "full").strip().lower()
+    if system_prefill == "full":
+        keep_prefix_len = system_len
+    elif system_prefill == "no_system":
+        keep_prefix_len = min(1, system_len)
+    else:
+        keep_prefix_len = 0
+
+    keep_ranges: list[list[int]] = []
+    if keep_prefix_len > 0:
+        keep_ranges.append([0, int(keep_prefix_len)])
+
+    if bool(llopa_config.get("see_past_assistant")):
+        starts = segments.get("assistant_header_starts")
+        ends = segments.get("assistant_turn_ends")
+        mask = segments.get("assistant_header_start_mask")
+        if isinstance(starts, torch.Tensor) and isinstance(ends, torch.Tensor):
+            starts = starts.reshape(1, -1) if starts.dim() == 1 else starts
+            ends = ends.reshape(1, -1) if ends.dim() == 1 else ends
+            if not isinstance(mask, torch.Tensor) or mask.shape != starts.shape:
+                mask = starts >= 0
+            else:
+                mask = mask.to(dtype=torch.bool)
+            turns = min(int(starts.size(1)), int(ends.size(1)))
+            for col in range(turns):
+                if not bool(mask[0, col].item()):
+                    continue
+                start = int(starts[0, col].item())
+                end = int(ends[0, col].item())
+                if start >= prefix_len:
+                    continue
+                start = max(start, keep_prefix_len)
+                end = min(end, prefix_len)
+                if end > start:
+                    keep_ranges.append([start, end])
+
+    keep_ranges.sort()
+    merged: list[list[int]] = []
+    for start, end in keep_ranges:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+
+    return {
+        "lower_k": int(llopa_config["layers"]),
+        "keep_prefix_len": int(keep_prefix_len),
+        "drop_len": max(0, int(prefix_len) - int(keep_prefix_len)),
+        "tail_start": int(prefix_len),
+        "prompt_len": int(prompt_len),
+        "keep_ranges": merged,
+    }
 
 # Verbose versions of key methods in VLLM from lm_eval.models.vllm_causallms
 
@@ -92,6 +288,11 @@ class VLLM_Verbose(VLLM):
                 "model-type is `vllm` but `vllm` is not installed! Please install vllm via `pip install -e .[gpu]`"
             )
 
+        self._llopa_v2_vllm_generate_default = _normalize_bool(
+            kwargs.get("llopa_v2_vllm_generate", False)
+        )
+        self._llopa_v2_vllm_config = _configure_llopa_v2_vllm(kwargs)
+
         self.vllm_logit_bias = kwargs.pop("vllm_logit_bias", None)
         if version.parse(self.vllm_version) < version.parse("0.6.3") and self.vllm_logit_bias:
             raise RuntimeError(
@@ -113,6 +314,12 @@ class VLLM_Verbose(VLLM):
         #    del kwargs["revision"]
 
         self.vllm_for_mc = kwargs.pop("vllm_for_mc", False)
+        if self._llopa_v2_vllm_generate_default:
+            kwargs["enable_prefix_caching"] = _normalize_bool(
+                kwargs.get("enable_prefix_caching", False)
+            )
+        for key in LLOPA_V2_VLLM_KEYS:
+            kwargs.pop(key, None)
 
         super().__init__(pretrained, device=device, **kwargs)
 
@@ -143,15 +350,56 @@ class VLLM_Verbose(VLLM):
         except Exception:
             pass
 
+    def _model_generate_with_llopa_ctx(
+        self,
+        requests: List[List[int]],
+        llopa_contexts: List[dict[str, Any] | None],
+        *,
+        max_tokens: int,
+        stop: Optional[List[str]],
+        kwargs: dict[str, Any],
+    ):
+        if self.data_parallel_size > 1:
+            raise ValueError("llopa_v2_vllm_generate does not support data_parallel_size > 1.")
+
+        from vllm import SamplingParams
+
+        base_kwargs = self.modify_gen_kwargs(copy.deepcopy(kwargs))
+        prompts = [{"prompt_token_ids": list(token_ids)} for token_ids in requests]
+        sampling_params = []
+        for ctx in llopa_contexts:
+            per_kwargs = copy.deepcopy(base_kwargs)
+            extra_args = per_kwargs.pop("extra_args", None)
+            if not isinstance(extra_args, dict):
+                extra_args = {}
+            if ctx is not None:
+                extra_args["llopa_ctx"] = ctx
+            if extra_args:
+                per_kwargs["extra_args"] = extra_args
+            sampling_params.append(
+                SamplingParams(max_tokens=max_tokens, stop=stop, **per_kwargs)
+            )
+
+        generate_kwargs = {
+            "sampling_params": sampling_params,
+            "use_tqdm": True if self.batch_size == "auto" else False,
+        }
+        if self.lora_request is not None:
+            generate_kwargs["lora_request"] = self.lora_request
+        return self.model.generate(prompts, **generate_kwargs)
+
     def generate_until_verbose(
         self, requests: List[GenerateUntilRequest], disable_tqdm: bool = False
     ) -> List[dict]:
         # oe-eval: Convert compute context and all_gen_kwargs in a custom way, then minimal changes needed below
         list_context = []
         list_gen_kwargs = []
+        list_prompt_messages = []
+        list_prompt_add_generation_prompt = []
+        list_structured_prompt_segments = []
         for request in requests:
             kwargs = request.generation_kwargs
-            kwargs, removed_prompt_kwargs = _strip_structured_prompt_kwargs(self.model, kwargs)
+            kwargs, removed_prompt_kwargs = _strip_structured_prompt_kwargs(self, kwargs)
             if removed_prompt_kwargs and not getattr(
                 self, "_warned_ignored_structured_prompt_kwargs", False
             ):
@@ -160,8 +408,17 @@ class VLLM_Verbose(VLLM):
                 )
                 self._warned_ignored_structured_prompt_kwargs = True
             kwargs["until"] = request.stop_sequences
+            prompt_messages = kwargs.pop("prompt_messages", getattr(request, "prompt_messages", None))
+            prompt_add_generation_prompt = kwargs.pop(
+                "prompt_add_generation_prompt",
+                getattr(request, "prompt_add_generation_prompt", None),
+            )
+            structured_prompt_segments = kwargs.pop("structured_prompt_segments", None)
             list_context.append(cast(str, request.context))
             list_gen_kwargs.append(kwargs)
+            list_prompt_messages.append(prompt_messages)
+            list_prompt_add_generation_prompt.append(prompt_add_generation_prompt)
+            list_structured_prompt_segments.append(structured_prompt_segments)
         res = []
 
         # batch tokenize contexts
@@ -170,7 +427,15 @@ class VLLM_Verbose(VLLM):
             list_context, add_special_tokens=self.add_bos_token
         ).input_ids
         requests_tup = [
-            ((a, b), c) for a, b, c in zip(list_context, list_context_encoding, list_gen_kwargs)
+            ((a, b, pm, pagp, seg), c)
+            for a, b, pm, pagp, seg, c in zip(
+                list_context,
+                list_context_encoding,
+                list_prompt_messages,
+                list_prompt_add_generation_prompt,
+                list_structured_prompt_segments,
+                list_gen_kwargs,
+            )
         ]
 
         def _collate_gen(_requests):
@@ -199,7 +464,13 @@ class VLLM_Verbose(VLLM):
         context_length_warning = False
         for chunk in chunks:
             context_and_encoding, all_gen_kwargs = zip(*chunk)
-            context, context_encoding = zip(*context_and_encoding)
+            (
+                context,
+                context_encoding,
+                all_prompt_messages,
+                all_prompt_add_generation_prompt,
+                all_structured_prompt_segments,
+            ) = zip(*context_and_encoding)
             context_lengths = [len(x) for x in context_encoding]
             # we assume all gen kwargs in the batch are the same
             # this is safe to assume because the `grouper` object ensures it.
@@ -264,6 +535,13 @@ class VLLM_Verbose(VLLM):
                             + '"consider using "truncate_context": True'
                         )
 
+            needs_llopa_v2_vllm = bool(self._llopa_v2_vllm_generate_default)
+            if needs_llopa_v2_vllm and any(len(x) > max_ctx_len for x in context_encoding):
+                raise ValueError(
+                    "llopa_v2_vllm_generate cannot use left-truncated contexts because "
+                    "LLoPA visibility metadata is position-based. Increase OE_EVAL_MAX_LENGTH "
+                    "or lower max_gen_toks."
+                )
             context_encoding_trunc = [x[-max_ctx_len:] for x in context_encoding]
 
             kwargs["logprobs"] = 1  # oe-eval: always return logprobs
@@ -275,14 +553,40 @@ class VLLM_Verbose(VLLM):
                     """
                 )
                 kwargs["logit_bias"] = self.vllm_logit_bias
+            llopa_contexts = None
+            if needs_llopa_v2_vllm:
+                llopa_contexts = [
+                    _build_llopa_ctx_from_prompt_metadata(
+                        self.tokenizer,
+                        prompt_messages=prompt_messages,
+                        prompt_add_generation_prompt=prompt_add_generation_prompt,
+                        structured_prompt_segments=structured_prompt_segments,
+                        llopa_config=self._llopa_v2_vllm_config or {},
+                    )
+                    for prompt_messages, prompt_add_generation_prompt, structured_prompt_segments in zip(
+                        all_prompt_messages,
+                        all_prompt_add_generation_prompt,
+                        all_structured_prompt_segments,
+                    )
+                ]
+
             # perform batched generation
-            cont = self._model_generate(
-                requests=context_encoding_trunc,
-                generate=True,
-                max_tokens=max_gen_toks,
-                stop=until,
-                **kwargs,
-            )
+            if llopa_contexts is not None and any(ctx is not None for ctx in llopa_contexts):
+                cont = self._model_generate_with_llopa_ctx(
+                    context_encoding_trunc,
+                    llopa_contexts,
+                    max_tokens=max_gen_toks,
+                    stop=until,
+                    kwargs=kwargs,
+                )
+            else:
+                cont = self._model_generate(
+                    requests=context_encoding_trunc,
+                    generate=True,
+                    max_tokens=max_gen_toks,
+                    stop=until,
+                    **kwargs,
+                )
 
             # cache generations
             for output, context, context_length in zip(cont, context, context_lengths):

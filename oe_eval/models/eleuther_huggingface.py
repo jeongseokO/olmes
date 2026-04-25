@@ -106,6 +106,12 @@ def _supports_structured_prompt_generate(model: Any, generation_kwargs: Optional
     if generation_kwargs:
         if bool(generation_kwargs.get("unified_llopa_generate")):
             return True
+        if bool(generation_kwargs.get("llopa_v2_batch_generate")):
+            return True
+        if bool(generation_kwargs.get("llopa_v2_generate")):
+            return True
+        if bool(generation_kwargs.get("llopa_v3_generate")):
+            return True
         if bool(generation_kwargs.get("direct_llopa_generate")):
             return True
         if bool(generation_kwargs.get("runtime_prefill_freeze")):
@@ -118,6 +124,10 @@ def _supports_structured_prompt_generate(model: Any, generation_kwargs: Optional
         return True
     if bool(getattr(model, "_unified_llopa_generate_default", False)):
         return True
+    if bool(getattr(model, "_llopa_v2_batch_generate_default", False)):
+        return True
+    if bool(getattr(model, "_llopa_v2_generate_default", False)):
+        return True
     if bool(getattr(model, "_direct_llopa_generate_default", False)):
         return True
     if getattr(model, "_runtime_prefill_freeze_layers", None) is not None:
@@ -125,6 +135,9 @@ def _supports_structured_prompt_generate(model: Any, generation_kwargs: Optional
     if getattr(model, "_runtime_prefill_solo_layers", None) is not None:
         return True
     if str(getattr(model, "_capsule_inference_path", "") or "") in {
+        "llopa_v2",
+        "llopa_v3",
+        "llopa_v2_batch",
         "runtime_freeze",
         "runtime_solo",
     }:
@@ -148,6 +161,12 @@ def _structured_prompt_runtime_requested(model: Any, generation_kwargs: Optional
     if generation_kwargs:
         if bool(generation_kwargs.get("unified_llopa_generate")):
             return True
+        if bool(generation_kwargs.get("llopa_v2_batch_generate")):
+            return True
+        if bool(generation_kwargs.get("llopa_v2_generate")):
+            return True
+        if bool(generation_kwargs.get("llopa_v3_generate")):
+            return True
         if bool(generation_kwargs.get("direct_llopa_generate")):
             return True
         if bool(generation_kwargs.get("runtime_prefill_freeze")):
@@ -158,10 +177,37 @@ def _structured_prompt_runtime_requested(model: Any, generation_kwargs: Optional
         return False
     return bool(
         getattr(model, "_unified_llopa_generate_default", False)
+        or getattr(model, "_llopa_v2_batch_generate_default", False)
+        or getattr(model, "_llopa_v2_generate_default", False)
         or getattr(model, "_direct_llopa_generate_default", False)
         or (getattr(model, "_runtime_prefill_freeze_layers", None) is not None)
         or (getattr(model, "_runtime_prefill_solo_layers", None) is not None)
-        or str(getattr(model, "_capsule_inference_path", "") or "") in {"runtime_freeze", "runtime_solo"}
+        or str(getattr(model, "_capsule_inference_path", "") or "") in {"llopa_v2", "llopa_v3", "llopa_v2_batch", "runtime_freeze", "runtime_solo"}
+    )
+
+
+def _llopa_v2_batch_runtime_requested(model: Any, generation_kwargs: Optional[dict]) -> bool:
+    if generation_kwargs and bool(generation_kwargs.get("llopa_v2_batch_generate")):
+        return True
+    if model is None:
+        return False
+    return bool(
+        getattr(model, "_llopa_v2_batch_generate_default", False)
+        or str(getattr(model, "_capsule_inference_path", "") or "") == "llopa_v2_batch"
+    )
+
+
+def _capsule_compact_generate_scores_enabled() -> bool:
+    raw = os.environ.get("CAPSULE_COMPACT_GENERATE_SCORES", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _should_use_capsule_compact_generate_scores(
+    model: Any, generation_kwargs: Optional[dict]
+) -> bool:
+    return (
+        _capsule_compact_generate_scores_enabled()
+        and _structured_prompt_runtime_requested(model, generation_kwargs)
     )
 
 
@@ -423,6 +469,11 @@ class HFLM_Verbose(HFLM):
             "runtime_prefill_solo_layers",
             "runtime_prefill_solo_attn",
             "runtime_prefill_solo_system_prefill",
+            "runtime_prefill_solo_v2",
+            "runtime_prefill_solo_v2_layers",
+            "runtime_prefill_solo_v2_attn",
+            "runtime_prefill_solo_v2_system_prefill",
+            "runtime_prefill_solo_v2_with_bos",
             "runtime_llopa_prefill",
             "runtime_llopa_layers",
             "runtime_llopa_attn",
@@ -434,6 +485,35 @@ class HFLM_Verbose(HFLM):
             "unified_llopa_system_prefill",
             "unified_llopa_user_prefill",
             "unified_llopa_no_upper_attn",
+            "unified_llopa_see_past_assistant",
+            "llopa_v2_batch_generate",
+            "llopa_v2_generate",
+            "llopa_v3_generate",
+            "llopa_v2_layers",
+            "llopa_v2_attn",
+            "llopa_v2_system_prefill",
+            "llopa_v2_user_prefill",
+            "llopa_v2_replay_module",
+            "llopa_v2_last_layer_module",
+            "llopa_v2_replay_per_layers",
+            "llopa_v2_no_upper_attn",
+            "llopa_v2_see_past_assistant",
+            "llopa_v2_seed_mode",
+            "optimized_llopa_generate",
+            "optimized_llopa_layers",
+            "optimized_llopa_attn",
+            "optimized_llopa_system_prefill",
+            "optimized_llopa_user_prefill",
+            "optimized_llopa_replay_module",
+            "optimized_llopa_last_layer_module",
+            "optimized_llopa_replay_per_layers",
+            "optimized_llopa_no_upper_attn",
+            "optimized_llopa_see_past_assistant",
+            "optimized_llopa_variant",
+            "optimized_llopa_seed_mode",
+            "optimized_llopa_upper_prepare_mode",
+            "optimized_llopa_upper_bucket_multiple",
+            "optimized_llopa_seq_bucket_multiple",
             "direct_llopa_generate",
             "direct_llopa_layers",
             "direct_llopa_attn",
@@ -1088,7 +1168,7 @@ class HFLM_Verbose(HFLM):
         self, requests: List[GenerateUntilRequest], disable_tqdm: bool = False
     ) -> List[dict]:
         # Convert to request_args used in original lm_eval generate_until for minimal diff
-        request_args: List[Tuple[str, dict, Optional[List[dict]], Optional[bool]]] = []
+        request_args: List[Tuple[str, dict, Optional[List[dict]], Optional[bool], Optional[dict]]] = []
         for request in requests:
             kwargs = request.generation_kwargs
             kwargs, removed_prompt_kwargs = _strip_structured_prompt_kwargs(self.model, kwargs)
@@ -1100,20 +1180,25 @@ class HFLM_Verbose(HFLM):
                 )
                 self._warned_ignored_structured_prompt_kwargs = True
             kwargs["until"] = request.stop_sequences
-            prompt_messages = getattr(request, "prompt_messages", None)
-            prompt_add_generation_prompt = getattr(request, "prompt_add_generation_prompt", None)
+            prompt_messages = kwargs.pop("prompt_messages", getattr(request, "prompt_messages", None))
+            prompt_add_generation_prompt = kwargs.pop(
+                "prompt_add_generation_prompt",
+                getattr(request, "prompt_add_generation_prompt", None),
+            )
+            structured_prompt_segments = kwargs.pop("structured_prompt_segments", None)
             request_args.append(
                 (
                     cast(str, request.context),
                     kwargs,
                     prompt_messages,
                     prompt_add_generation_prompt,
+                    structured_prompt_segments,
                 )
             )
         res = []
         assert isinstance(request_args[0][0], str), request_args[0]
 
-        def _collate(req: Tuple[str, dict, Optional[List[dict]], Optional[bool]]):
+        def _collate(req: Tuple[str, dict, Optional[List[dict]], Optional[bool], Optional[dict]]):
             """Defines the key for the sorted method"""
             # the negative sign on len(toks) sorts descending - this has a few advantages:
             # - time estimates will always be over not underestimates, which is more useful for planning
@@ -1161,8 +1246,92 @@ class HFLM_Verbose(HFLM):
         )
         context_length_warning = False
         chunks = re_ords.get_batched(n=batch_size, batch_fn=batch_fn)
+
+        def _append_generate_output(
+            output,
+            contexts_for_output,
+            context_width: int,
+            cache_gen_kwargs_for_output,
+            until_stop,
+        ) -> None:
+            cont_toks_list = output["sequences"].tolist()
+            gen_sequences = output["sequences"][:, context_width:]
+
+            compact_log_probs = getattr(output, "generated_token_logprobs", None)
+            if compact_log_probs is None and isinstance(output, dict):
+                compact_log_probs = output.get("generated_token_logprobs")
+            if isinstance(compact_log_probs, torch.Tensor):
+                seq_len = min(gen_sequences.size(1), compact_log_probs.size(1))
+                if seq_len <= 0:
+                    gen_log_probs_list = compact_log_probs[:, :0]
+                else:
+                    gen_sequences = gen_sequences[:, :seq_len]
+                    gen_log_probs_list = compact_log_probs[:, :seq_len]
+            else:
+                scores = torch.stack(output["scores"], dim=1)  # shape [batch_size, seq_len, vocab_size]
+                log_probs = F.log_softmax(scores, dim=-1)
+                # Align in case custom generate returns fewer scores than tokens.
+                seq_len = min(gen_sequences.size(1), scores.size(1))
+                if seq_len <= 0:
+                    gen_log_probs_list = log_probs[:, :0]
+                else:
+                    gen_sequences = gen_sequences[:, :seq_len]
+                    scores = scores[:, :seq_len]
+                    log_probs = log_probs[:, :seq_len]
+                    gen_log_probs_list = torch.gather(
+                        log_probs, 2, gen_sequences[:, :, None]
+                    ).squeeze(-1)
+
+            for cont_toks, gen_log_probs, context, request_gen_kwargs in zip(
+                cont_toks_list,
+                gen_log_probs_list,
+                contexts_for_output,
+                cache_gen_kwargs_for_output,
+            ):
+                # discard context + left-padding toks if using causal decoder-only LM
+                if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
+                    cont_toks = cont_toks[context_width:]
+
+                s_raw = self.tok_decode(cont_toks)
+                s = cut_at_stop_sequence(s_raw, until_stop)
+                no_pad_len = len(cont_toks)
+                for idx, tok in enumerate(cont_toks):
+                    # Keep the first eot_token encountered
+                    if tok == self.eot_token_id:
+                        no_pad_len = idx + 1
+                        break
+                    if tok == self.tokenizer.pad_token_id:
+                        no_pad_len = idx
+                        break
+                cont_toks_no_pad = cont_toks[:no_pad_len]
+
+                logits = gen_log_probs[: len(cont_toks_no_pad)]
+                sum_logits = logits.sum().item()
+
+                res1 = {
+                    "continuation": s,
+                    "sum_logits": sum_logits,
+                    "num_tokens": len(cont_toks_no_pad),
+                    # "tokens": cont_toks_no_pad,
+                    # "logits": logits.tolist(),
+                }
+                if s_raw != s:
+                    res1["continuation_raw"] = s_raw
+
+                res.append(res1)
+                self.cache_hook.add_partial(
+                    "generate_until", (context, request_gen_kwargs), s
+                )
+                pbar.update(1)
+
         for chunk in chunks:
-            contexts, all_gen_kwargs, all_prompt_messages, all_prompt_add_generation_prompt = zip(*chunk)
+            (
+                contexts,
+                all_gen_kwargs,
+                all_prompt_messages,
+                all_prompt_add_generation_prompt,
+                all_structured_prompt_segments,
+            ) = zip(*chunk)
             # we assume all gen kwargs in the batch are the same
             # this is safe to assume because the `grouper` object ensures it.
             gen_kwargs = all_gen_kwargs[0]
@@ -1253,14 +1422,99 @@ class HFLM_Verbose(HFLM):
                         "falling back to model.generate() for that request."
                     )
                     self._warned_failed_plain_prompt_structured_segments = True
-            elif any(plain_structured_needed) and not getattr(
-                self, "_warned_plain_prompt_structured_segments_batching", False
-            ):
-                eval_logger.warning(
-                    "Skipping automatic structured prompt segment inference for a multi-example "
-                    "generation batch. Use batch_size=1 for unified LLoPA on plain-text prompts."
-                )
-                self._warned_plain_prompt_structured_segments_batching = True
+            has_prompt_messages = any(pm is not None for pm in all_prompt_messages)
+            has_structured_prompt_segments = any(seg is not None for seg in all_structured_prompt_segments)
+            structured_batch_requested = _llopa_v2_batch_runtime_requested(self.model, kwargs)
+            structured_serial = len(chunk) != 1 and (
+                has_prompt_messages or has_structured_prompt_segments or any(plain_structured_needed)
+            ) and not structured_batch_requested
+            had_explicit_max_length = "max_length" in kwargs
+
+            if structured_serial:
+                serial_common_kwargs = copy.deepcopy(kwargs)
+                serial_common_kwargs["output_scores"] = True
+                serial_common_kwargs["return_dict_in_generate"] = True
+                if _should_use_capsule_compact_generate_scores(
+                    self.model, serial_common_kwargs
+                ):
+                    serial_common_kwargs["capsule_compact_scores"] = True
+                for (
+                    context,
+                    request_gen_kwargs,
+                    prompt_messages_arg,
+                    prompt_add_generation_prompt_arg,
+                    structured_prompt_segments_arg,
+                    plain_needed,
+                ) in zip(
+                    contexts,
+                    all_gen_kwargs,
+                    all_prompt_messages,
+                    all_prompt_add_generation_prompt,
+                    all_structured_prompt_segments,
+                    plain_structured_needed,
+                ):
+                    single_kwargs = copy.deepcopy(serial_common_kwargs)
+                    if structured_prompt_segments_arg is not None:
+                        single_kwargs["structured_prompt_segments"] = structured_prompt_segments_arg
+                    elif prompt_messages_arg is not None:
+                        single_kwargs["prompt_messages"] = prompt_messages_arg
+                        single_kwargs["prompt_add_generation_prompt"] = bool(
+                            prompt_add_generation_prompt_arg
+                        )
+                    elif plain_needed:
+                        structured_segments = _build_plain_prompt_structured_segments(
+                            self.tokenizer,
+                            context,
+                            device=self.device,
+                            add_bos_token=bool(self.add_bos_token),
+                            left_truncate_len=max_ctx_len,
+                        )
+                        if structured_segments is not None:
+                            single_kwargs["structured_prompt_segments"] = structured_segments
+                        elif not getattr(
+                            self,
+                            "_warned_failed_plain_prompt_structured_segments",
+                            False,
+                        ):
+                            eval_logger.warning(
+                                "Could not infer structured prompt segments from a plain-text prompt; "
+                                "falling back to model.generate() for that request."
+                            )
+                            self._warned_failed_plain_prompt_structured_segments = True
+
+                    single_context_enc, single_attn_masks = self.tok_batch_encode(
+                        [context],
+                        left_truncate_len=max_ctx_len,
+                        truncation=self.truncation,
+                    )
+                    single_context_enc = single_context_enc.to(self.device)
+                    single_attn_masks = single_attn_masks.to(self.device)
+                    if not had_explicit_max_length:
+                        single_kwargs["max_length"] = single_context_enc.shape[1] + max_gen_toks
+
+                    output = self._model_generate(
+                        context=single_context_enc,
+                        attention_mask=single_attn_masks,
+                        stop=until,
+                        **single_kwargs,
+                    )
+                    if (
+                        self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM
+                        and _structured_prompt_runtime_requested(self.model, single_kwargs)
+                        and output["sequences"].shape[1] < single_context_enc.shape[1]
+                    ):
+                        raise RuntimeError(
+                            "Structured LLoPA generate returned sequences shorter than the encoded context: "
+                            f"{output['sequences'].shape[1]} < {single_context_enc.shape[1]}."
+                        )
+                    _append_generate_output(
+                        output,
+                        (context,),
+                        single_context_enc.shape[1],
+                        (request_gen_kwargs,),
+                        until,
+                    )
+                continue
 
             # encode, pad, and truncate contexts for this batch
             context_enc, attn_masks = self.tok_batch_encode(
@@ -1271,25 +1525,76 @@ class HFLM_Verbose(HFLM):
             context_enc = context_enc.to(self.device)
             attn_masks = attn_masks.to(self.device)
 
-            if "max_length" not in kwargs:
+            if not had_explicit_max_length:
                 kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
 
             prompt_messages_arg = None
             prompt_add_generation_prompt_arg = None
-            if any(pm is not None for pm in all_prompt_messages):
-                if len(chunk) != 1:
+            structured_segments_arg = None
+            if has_structured_prompt_segments:
+                if len(chunk) != 1 and structured_batch_requested:
+                    if not all(seg is not None for seg in all_structured_prompt_segments):
+                        raise ValueError(
+                            "llopa_v2_batch_generate does not support mixing structured_prompt_segments with other prompt metadata in one batch."
+                        )
+                    structured_segments_arg = list(all_structured_prompt_segments)
+                elif len(chunk) != 1:
+                    raise ValueError(
+                        "Structured prompt generation currently requires batch_size=1 when structured_prompt_segments are provided."
+                    )
+                else:
+                    structured_segments_arg = all_structured_prompt_segments[0]
+            elif has_prompt_messages:
+                if len(chunk) != 1 and structured_batch_requested:
+                    if not all(pm is not None for pm in all_prompt_messages):
+                        raise ValueError(
+                            "llopa_v2_batch_generate does not support mixing prompt_messages and inferred plain prompts in one batch."
+                        )
+                    prompt_messages_arg = list(all_prompt_messages)
+                    prompt_add_generation_prompt_arg = [
+                        bool(item) for item in all_prompt_add_generation_prompt
+                    ]
+                elif len(chunk) != 1:
                     raise ValueError(
                         "Structured prompt generation currently requires batch_size=1 when prompt_messages are provided."
                     )
-                prompt_messages_arg = all_prompt_messages[0]
-                prompt_add_generation_prompt_arg = all_prompt_add_generation_prompt[0]
+                else:
+                    prompt_messages_arg = all_prompt_messages[0]
+                    prompt_add_generation_prompt_arg = all_prompt_add_generation_prompt[0]
+            elif structured_batch_requested and any(plain_structured_needed):
+                structured_segments = []
+                for context, plain_needed in zip(contexts, plain_structured_needed):
+                    if not plain_needed:
+                        structured_segments.append(None)
+                        continue
+                    structured_segments.append(
+                        _build_plain_prompt_structured_segments(
+                            self.tokenizer,
+                            context,
+                            device=self.device,
+                            add_bos_token=bool(self.add_bos_token),
+                            left_truncate_len=max_ctx_len,
+                        )
+                    )
+                if any(item is None for item in structured_segments):
+                    raise ValueError(
+                        "llopa_v2_batch_generate could not infer structured segments for every plain prompt in the batch."
+                    )
+                structured_segments_arg = structured_segments
 
             # perform batched generation, with args for logit scores
             kwargs["output_scores"] = True
             kwargs["return_dict_in_generate"] = True
+            if _should_use_capsule_compact_generate_scores(self.model, kwargs):
+                kwargs["capsule_compact_scores"] = True
             if prompt_messages_arg is not None:
                 kwargs["prompt_messages"] = prompt_messages_arg
-                kwargs["prompt_add_generation_prompt"] = bool(prompt_add_generation_prompt_arg)
+                if isinstance(prompt_add_generation_prompt_arg, list):
+                    kwargs["prompt_add_generation_prompt"] = prompt_add_generation_prompt_arg
+                else:
+                    kwargs["prompt_add_generation_prompt"] = bool(prompt_add_generation_prompt_arg)
+            if structured_segments_arg is not None:
+                kwargs["structured_prompt_segments"] = structured_segments_arg
             output = self._model_generate(
                 context=context_enc,
                 attention_mask=attn_masks,
@@ -1305,64 +1610,13 @@ class HFLM_Verbose(HFLM):
                     "Structured LLoPA generate returned sequences shorter than the encoded context: "
                     f"{output['sequences'].shape[1]} < {context_enc.shape[1]}."
                 )
-            # Extract generated sequences and corresponding logits
-            cont_toks_list = output["sequences"].tolist()
-            gen_sequences = output["sequences"][:, context_enc.shape[1] :]
-
-            # stack scores generated at each step
-            scores = torch.stack(output["scores"], dim=1)  # shape [batch_size, seq_len, vocab_size]
-            log_probs = F.log_softmax(scores, dim=-1)
-            # Align in case custom generate returns fewer scores than tokens.
-            seq_len = min(gen_sequences.size(1), scores.size(1))
-            if seq_len <= 0:
-                gen_scores_list = scores[:, :0]
-                gen_log_probs_list = log_probs[:, :0]
-            else:
-                gen_sequences = gen_sequences[:, :seq_len]
-                scores = scores[:, :seq_len]
-                log_probs = log_probs[:, :seq_len]
-                # collect scores/logits of the generated token
-                gen_scores_list = torch.gather(scores, 2, gen_sequences[:, :, None]).squeeze(
-                    -1
-                )  # shape [batch_size, seq_len]
-                gen_log_probs_list = torch.gather(log_probs, 2, gen_sequences[:, :, None]).squeeze(-1)
-
-            for cont_toks, gen_scores, gen_log_probs, context in zip(
-                cont_toks_list, gen_scores_list, gen_log_probs_list, contexts
-            ):
-                # discard context + left-padding toks if using causal decoder-only LM
-                if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
-                    cont_toks = cont_toks[context_enc.shape[1] :]
-
-                s_raw = self.tok_decode(cont_toks)
-                s = cut_at_stop_sequence(s_raw, until)
-                no_pad_len = len(cont_toks)
-                for idx, tok in enumerate(cont_toks):
-                    # Keep the first eot_token encountered
-                    if tok == self.eot_token_id:
-                        no_pad_len = idx + 1
-                        break
-                    if tok == self.tokenizer.pad_token_id:
-                        no_pad_len = idx
-                        break
-                cont_toks_no_pad = cont_toks[:no_pad_len]
-
-                logits = gen_log_probs[: len(cont_toks_no_pad)]
-                sum_logits = logits.sum().item()
-
-                res1 = {
-                    "continuation": s,
-                    "sum_logits": sum_logits,
-                    "num_tokens": len(cont_toks_no_pad),
-                    # "tokens": cont_toks_no_pad,
-                    # "logits": logits.tolist(),
-                }
-                if s_raw != s:
-                    res1["continuation_raw"] = s_raw
-
-                res.append(res1)
-                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), s)
-                pbar.update(1)
+            _append_generate_output(
+                output,
+                contexts,
+                context_enc.shape[1],
+                all_gen_kwargs,
+                until,
+            )
         # reorder this group of results back to original unsorted form
         res = re_ords.get_original(res)
 

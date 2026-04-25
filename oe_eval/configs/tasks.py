@@ -1,4 +1,5 @@
 import copy
+import os
 
 from oe_eval.configs.regexes import OLMO_3_REGEXES
 from oe_eval.data.agi_eval_tasks import AGI_EVAL_ENGLISH_DATASETS
@@ -35,6 +36,16 @@ from oe_eval.data.zero_scrolls_tasks import ZERO_SCROLLS_TASKS
 from oe_eval.datasets_extra.paloma_sources import PALOMA_SOURCES
 
 TASK_CONFIGS: dict = {}
+
+
+def _env_optional_str(name: str, default: str | None = None) -> str | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = str(raw).strip()
+    if value.lower() in {"", "none", "null"}:
+        return None
+    return value
 
 # Add tasks in alphabetical order of the task name key
 TASK_CONFIGS.update(
@@ -505,7 +516,7 @@ TASK_CONFIGS.update(
             "num_shots": 3,
             "chat_overrides": {
                 "context_kwargs": {
-                    "assistant_prefix": "Answer:",
+                    "assistant_prefix": _env_optional_str("DROP_CHAT_ASSISTANT_PREFIX", "Answer:"),
                     "fewshot_as_multiturn": True,
                 },
             },
