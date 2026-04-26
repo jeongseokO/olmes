@@ -817,6 +817,125 @@ class HFLM_Verbose(HFLM):
 
         return encoding["input_ids"], encoding["attention_mask"]
 
+    def _llopa_v2_loglikelihood_enabled(self) -> bool:
+        if self.AUTO_MODEL_CLASS != transformers.AutoModelForCausalLM:
+            return False
+        model = self.model
+        inference_path = str(getattr(model, "_capsule_inference_path", "") or "")
+        return bool(
+            getattr(model, "_llopa_v2_generate_default", False)
+            or getattr(model, "_llopa_v2_batch_generate_default", False)
+            or inference_path in {"llopa_v2", "llopa_v3", "llopa_v2_batch"}
+        )
+
+    def _infer_llopa_v2_loglikelihood_boundary(
+        self,
+        context: Optional[str],
+        context_enc: List[int],
+        continuation_enc: List[int],
+        inplen: int,
+    ) -> Tuple[int, int]:
+        split_start_global = None
+        system_len_global = 0
+        segments = None
+        if isinstance(context, str):
+            segments = _build_plain_prompt_structured_segments(
+                self.tokenizer,
+                context,
+                device="cpu",
+                add_bos_token=bool(self.add_bos_token),
+            )
+        if isinstance(segments, dict):
+            user_ids = segments.get("user_ids")
+            system_ids = segments.get("system_ids")
+            if isinstance(user_ids, torch.Tensor) and user_ids.dim() == 2:
+                split_start_global = int(user_ids.size(1))
+            if isinstance(system_ids, torch.Tensor) and system_ids.dim() == 2:
+                system_len_global = int(system_ids.size(1))
+
+        if split_start_global is None:
+            # No explicit assistant prefix was found. Use the last context token
+            # as the seed position so every continuation token is still scored
+            # through the LLoPA prefill/decode path.
+            split_start_global = max(len(context_enc) - 1, 0)
+
+        total_tokens = len(context_enc) + len(continuation_enc)
+        window_start = max(0, total_tokens - (self.max_length + 1))
+        split_start = max(0, int(split_start_global) - window_start)
+        system_len = max(0, int(system_len_global) - window_start)
+
+        # The model input excludes the final continuation token. To score all
+        # continuation tokens, the decode segment must include at least the last
+        # context token plus continuation[:-1].
+        latest_allowed_split = max(int(inplen) - len(continuation_enc), 0)
+        split_start = min(split_start, latest_allowed_split)
+        split_start = min(split_start, max(int(inplen) - 1, 0))
+        system_len = min(system_len, split_start)
+        return split_start, system_len
+
+    def _llopa_v2_loglikelihood_call(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        split_starts: torch.Tensor,
+        system_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        model = self.model
+        lower_layers = int(getattr(model, "_llopa_v2_layers", 0) or 0)
+        if lower_layers <= 0:
+            raise RuntimeError(
+                "llopa_v2 loglikelihood was requested, but _llopa_v2_layers is not set."
+            )
+
+        if not hasattr(self, "_shown_llopa_v2_loglikelihood"):
+            print(
+                "[Capsule] llopa_v2 loglikelihood forward enabled "
+                f"(layers={lower_layers}, attn={getattr(model, '_llopa_v2_attn', 'causal')}, "
+                f"system_prefill={getattr(model, '_llopa_v2_system_prefill', 'full')})"
+            )
+            self._shown_llopa_v2_loglikelihood = True
+
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+                prefill_lower_layers=lower_layers,
+                prefill_lower_attn=str(getattr(model, "_llopa_v2_attn", "causal") or "causal"),
+                prefill_lower_system_prefill=str(
+                    getattr(model, "_llopa_v2_system_prefill", "full") or "full"
+                ),
+                prefill_lower_no_upper_attn=bool(
+                    getattr(model, "_llopa_v2_no_upper_attn", False)
+                ),
+                prefill_lower_split_start=split_starts,
+                prefill_lower_system_len=system_lens,
+                prefill_lower_see_past_assistant=bool(
+                    getattr(model, "_llopa_v2_see_past_assistant", False)
+                ),
+                prefill_lower_replay_module=str(
+                    getattr(model, "_llopa_v2_replay_module", "none") or "none"
+                ),
+                prefill_lower_replay_per_layers=int(
+                    getattr(model, "_llopa_v2_replay_per_layers", -1) or -1
+                ),
+            )
+
+        past_key_values = getattr(outputs, "past_key_values", None)
+        if not isinstance(getattr(past_key_values, "_tri_prefill_seed_meta", None), dict):
+            raise RuntimeError(
+                "llopa_v2 loglikelihood fell through to vanilla forward. "
+                "Use OE_EVAL_BATCH_SIZE=1 and PREFILL_ATTN=causal, or check that the "
+                "checkpoint exposes tri_vanilla_prefill_decode_forward."
+            )
+
+        logits = getattr(outputs, "logits", None)
+        if isinstance(logits, torch.Tensor):
+            return logits
+        if isinstance(outputs, (tuple, list)) and outputs and isinstance(outputs[0], torch.Tensor):
+            return outputs[0]
+        raise RuntimeError("llopa_v2 loglikelihood forward did not return logits.")
+
     def loglikelihood_rolling_verbose(
         self,
         requests: List[LoglikelihoodRollingRequest],
@@ -985,6 +1104,15 @@ class HFLM_Verbose(HFLM):
             if self.batch_size == "auto" and n_reordered_requests > 0 and not override_bs
             else None
         )
+        llopa_v2_loglikelihood = self._llopa_v2_loglikelihood_enabled()
+        if llopa_v2_loglikelihood and batch_size != 1:
+            if not hasattr(self, "_warned_llopa_v2_loglikelihood_batch_size"):
+                eval_logger.warning(
+                    "llopa_v2 loglikelihood requires serial requests in the HF path; forcing batch_size=1."
+                )
+                self._warned_llopa_v2_loglikelihood_batch_size = True
+            batch_size = 1
+            batch_fn = None
 
         chunks = re_ord.get_batched(n=batch_size, batch_fn=batch_fn)
         pbar = tqdm(
@@ -996,6 +1124,9 @@ class HFLM_Verbose(HFLM):
             inps = []
             cont_toks_list = []
             inplens = []
+            input_attns = []
+            llopa_split_starts = []
+            llopa_system_lens = []
 
             conts = []
             encoder_attns = []
@@ -1006,7 +1137,7 @@ class HFLM_Verbose(HFLM):
             # tensors, then we pack them together into a batch, call the model, and then pick it all apart
             # again because vectorizing is annoying
 
-            for _, context_enc, continuation_enc in chunk:
+            for request_str, context_enc, continuation_enc in chunk:
                 # sanity check
                 assert len(context_enc) > 0
                 assert len(continuation_enc) > 0
@@ -1027,6 +1158,21 @@ class HFLM_Verbose(HFLM):
                         device=self.device,
                     )
                     (inplen,) = inp.shape
+                    if llopa_v2_loglikelihood:
+                        context = None
+                        if isinstance(request_str, (tuple, list)) and request_str:
+                            context = request_str[0]
+                        elif isinstance(request_str, str):
+                            context = request_str
+                        split_start, system_len = self._infer_llopa_v2_loglikelihood_boundary(
+                            context,
+                            context_enc,
+                            continuation_enc,
+                            inplen,
+                        )
+                        input_attns.append(torch.ones_like(inp))
+                        llopa_split_starts.append(split_start)
+                        llopa_system_lens.append(system_len)
                 elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
                     inp = torch.tensor(
                         (context_enc)[-self.max_length :],
@@ -1067,6 +1213,10 @@ class HFLM_Verbose(HFLM):
                 batched_inps = pad_and_concat(
                     padding_len_inp, inps, padding_side="right"
                 )  # [batch, padding_len_inp]
+                if llopa_v2_loglikelihood:
+                    batched_attns = pad_and_concat(
+                        padding_len_inp, input_attns, padding_side="right"
+                    )
             elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
                 # TODO: left-pad encoder inps and mask?
                 batched_inps = pad_and_concat(padding_len_inp, inps)  # [batch, padding_len_inp]
@@ -1090,9 +1240,16 @@ class HFLM_Verbose(HFLM):
                 print(batched_inps)
                 self._shown_model_input = True
 
-            multi_logits = F.log_softmax(
-                self._model_call(batched_inps, **call_kwargs), dim=-1
-            )  # [batch, padding_length (inp or cont), vocab]
+            if llopa_v2_loglikelihood:
+                raw_logits = self._llopa_v2_loglikelihood_call(
+                    batched_inps,
+                    batched_attns,
+                    torch.tensor(llopa_split_starts, device=self.device, dtype=torch.long),
+                    torch.tensor(llopa_system_lens, device=self.device, dtype=torch.long),
+                )
+            else:
+                raw_logits = self._model_call(batched_inps, **call_kwargs)
+            multi_logits = F.log_softmax(raw_logits, dim=-1)  # [batch, seq, vocab]
 
             for (request_str, ctx_tokens, _), logits, inplen, cont_toks in zip(
                 chunk, multi_logits, inplens, cont_toks_list
