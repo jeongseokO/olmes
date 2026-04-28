@@ -1,4 +1,5 @@
 import copy
+import importlib
 import inspect
 import os
 import re
@@ -276,6 +277,89 @@ def _find_subsequence_start(full_ids: List[int], suffix_ids: List[int]) -> Optio
     last_start = len(full_ids) - len(suffix_ids)
     if full_ids[last_start:] == suffix_ids:
         return last_start
+    return None
+
+
+def _infer_plain_prompt_assistant_token_starts(
+    tokenizer: Any,
+    context: str,
+    *,
+    add_bos_token: bool = False,
+) -> List[int]:
+    char_starts: List[int] = []
+    for marker in EXPLICIT_ASSISTANT_HEADER_MARKERS:
+        start = 0
+        while True:
+            idx = context.find(marker, start)
+            if idx < 0:
+                break
+            char_starts.append(idx)
+            start = idx + len(marker)
+
+    if not char_starts:
+        final_start = _infer_plain_prompt_assistant_char_start(context)
+        if final_start is not None:
+            char_starts.append(final_start)
+
+    char_starts = sorted(set(char_starts))
+    if not char_starts:
+        return []
+
+    try:
+        encoded = tokenizer(
+            context,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+    except Exception:
+        try:
+            encoded = tokenizer(context, add_special_tokens=False)
+        except Exception:
+            return []
+
+    full_ids = list(encoded.get("input_ids") or [])
+    offsets = list(encoded.get("offset_mapping") or [])
+    if not full_ids:
+        return []
+
+    token_starts: List[int] = []
+    for char_start in char_starts:
+        token_start = None
+        if offsets and len(offsets) == len(full_ids):
+            for idx, offset in enumerate(offsets):
+                if not isinstance(offset, (list, tuple)) or len(offset) != 2:
+                    continue
+                if int(offset[0]) == int(char_start):
+                    token_start = idx
+                    break
+        if token_start is None:
+            try:
+                token_start = len(
+                    tokenizer.encode(context[:char_start], add_special_tokens=False)
+                )
+            except Exception:
+                token_start = None
+        if token_start is None:
+            continue
+        token_starts.append(int(token_start))
+
+    if add_bos_token:
+        bos_token_id = getattr(tokenizer, "bos_token_id", None)
+        if bos_token_id is not None and (not full_ids or int(full_ids[0]) != int(bos_token_id)):
+            token_starts = [start + 1 for start in token_starts]
+
+    return sorted(set(start for start in token_starts if start >= 0))
+
+
+def _get_capsule_matched_inband_seed_fn() -> Optional[Any]:
+    for module_name in ("llopa_inference", "Capsule.llopa_inference"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        fn = getattr(module, "_matched_inband_prefill_cache_and_logits", None)
+        if callable(fn):
+            return fn
     return None
 
 
@@ -879,6 +963,8 @@ class HFLM_Verbose(HFLM):
         attention_mask: torch.Tensor,
         split_starts: torch.Tensor,
         system_lens: torch.Tensor,
+        assistant_header_starts: Optional[torch.Tensor] = None,
+        assistant_header_start_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         model = self.model
         lower_layers = int(getattr(model, "_llopa_v2_layers", 0) or 0)
@@ -919,6 +1005,8 @@ class HFLM_Verbose(HFLM):
                 prefill_lower_replay_per_layers=int(
                     getattr(model, "_llopa_v2_replay_per_layers", -1) or -1
                 ),
+                assistant_header_starts=assistant_header_starts,
+                assistant_header_start_mask=assistant_header_start_mask,
             )
 
         past_key_values = getattr(outputs, "past_key_values", None)
@@ -935,6 +1023,293 @@ class HFLM_Verbose(HFLM):
         if isinstance(outputs, (tuple, list)) and outputs and isinstance(outputs[0], torch.Tensor):
             return outputs[0]
         raise RuntimeError("llopa_v2 loglikelihood forward did not return logits.")
+
+    def _llopa_v2_loglikelihood_continuation_logits(
+        self,
+        request_str: Tuple[str, str],
+        context_enc: List[int],
+        continuation_enc: List[int],
+    ) -> torch.Tensor:
+        model = self.model
+        lower_layers = int(getattr(model, "_llopa_v2_layers", 0) or 0)
+        if lower_layers <= 0:
+            raise RuntimeError(
+                "llopa_v2 loglikelihood was requested, but _llopa_v2_layers is not set."
+            )
+        if not continuation_enc:
+            raise RuntimeError("llopa_v2 loglikelihood received an empty continuation.")
+
+        context = request_str[0] if isinstance(request_str, (tuple, list)) and request_str else None
+        if not isinstance(context, str):
+            raise RuntimeError("llopa_v2 loglikelihood requires the rendered context string.")
+
+        segments = _build_plain_prompt_structured_segments(
+            self.tokenizer,
+            context,
+            device=self.device,
+            add_bos_token=bool(self.add_bos_token),
+        )
+        if not isinstance(segments, dict):
+            raise RuntimeError(
+                "llopa_v2 loglikelihood could not infer the final assistant prefix "
+                "from the rendered context."
+            )
+
+        prefill_attn = str(getattr(model, "_llopa_v2_attn", "causal") or "causal")
+        system_prefill = str(getattr(model, "_llopa_v2_system_prefill", "full") or "full")
+        no_upper_attn = bool(getattr(model, "_llopa_v2_no_upper_attn", False))
+        config = getattr(model, "config", None)
+        fusion_mode = str(getattr(config, "capsule_fusion_mode", "upper_only") or "upper_only").strip().lower()
+        raw_suffix_ids = getattr(config, "capsule_suffix_special_token_ids", None)
+        try:
+            configured_num_suffix_specials = max(
+                0, int(getattr(config, "capsule_num_suffix_specials", 0) or 0)
+            )
+        except Exception:
+            configured_num_suffix_specials = 0
+        suffix_token_ids: List[int] = []
+        if isinstance(raw_suffix_ids, (list, tuple)):
+            for raw_id in list(raw_suffix_ids)[:configured_num_suffix_specials]:
+                try:
+                    token_id = int(raw_id)
+                except Exception:
+                    continue
+                if token_id >= 0:
+                    suffix_token_ids.append(token_id)
+        if fusion_mode == "inband" and suffix_token_ids:
+            if bool(no_upper_attn):
+                raise RuntimeError(
+                    "llopa_v2 inband loglikelihood cannot use no_upper_attn=True because "
+                    "fusion specials are upper-layer context."
+                )
+            return self._llopa_v2_loglikelihood_inband_continuation_logits(
+                request_str,
+                context_enc,
+                continuation_enc,
+                num_suffix_specials=len(suffix_token_ids),
+            )
+
+        if not hasattr(self, "_shown_llopa_v2_loglikelihood"):
+            print(
+                "[Capsule] llopa_v2 loglikelihood seed/decode enabled "
+                f"(layers={lower_layers}, attn={getattr(model, '_llopa_v2_attn', 'causal')}, "
+                f"system_prefill={getattr(model, '_llopa_v2_system_prefill', 'full')})"
+            )
+            self._shown_llopa_v2_loglikelihood = True
+
+        replay_module = str(getattr(model, "_llopa_v2_replay_module", "none") or "none")
+        replay_per_layers = int(getattr(model, "_llopa_v2_replay_per_layers", -1) or -1)
+
+        system_ids = segments["system_ids"]
+        user_ids = segments["user_ids"]
+        assistant_ids = segments["assistant_prefill_ids"]
+
+        system_prefill_norm = system_prefill.strip().lower()
+        if system_prefill_norm not in {"full", "no_system", "no_bos_system"}:
+            system_prefill_norm = "full"
+        if system_prefill_norm == "full":
+            system_upper = system_ids
+            system_lower_extra = system_ids[:, :0]
+        elif system_prefill_norm == "no_system":
+            system_upper = system_ids[:, :1]
+            system_lower_extra = system_ids[:, 1:]
+        else:
+            system_upper = system_ids[:, :0]
+            system_lower_extra = system_ids
+
+        if system_lower_extra.numel() == 0:
+            user_llopa = user_ids
+        elif user_ids.numel() == 0:
+            user_llopa = system_lower_extra
+        else:
+            user_llopa = torch.cat([system_lower_extra, user_ids], dim=1)
+
+        prefill_fn = getattr(getattr(model, "model", None), "llopa_prefill_cache", None)
+        if not callable(prefill_fn):
+            raise RuntimeError("llopa_v2 loglikelihood requires model.model.llopa_prefill_cache.")
+
+        decode_prefix = torch.cat(
+            [
+                assistant_ids,
+                torch.tensor(
+                    [continuation_enc[:-1]],
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+            ],
+            dim=1,
+        )
+        if decode_prefix.numel() == 0:
+            raise RuntimeError("llopa_v2 loglikelihood could not build decode tokens.")
+
+        with torch.no_grad():
+            past_key_values = prefill_fn(
+                system_ids=system_upper,
+                user_ids=user_llopa,
+                assistant_ids=assistant_ids[:, :0],
+                lower_k=lower_layers,
+                prefill_mode="lower",
+                prefill_attn=prefill_attn,
+                return_last_assistant_hidden=False,
+                replay_module=replay_module,
+                replay_per_layers=replay_per_layers,
+            )
+            decode_outputs = model(
+                input_ids=decode_prefix,
+                past_key_values=past_key_values,
+                use_cache=True,
+                llopa_v2_decode=True,
+                llopa_v2_decode_layers=lower_layers,
+                llopa_v2_decode_no_upper_attn=no_upper_attn,
+                llopa_v2_decode_replay_module=replay_module,
+                llopa_v2_decode_replay_per_layers=replay_per_layers,
+                return_dict=True,
+            )
+        decode_logits = getattr(decode_outputs, "logits", None)
+        if not isinstance(decode_logits, torch.Tensor):
+            raise RuntimeError("llopa_v2 decode did not return logits.")
+
+        assistant_len = int(assistant_ids.size(1))
+        start = max(assistant_len - 1, 0)
+        end = start + len(continuation_enc)
+        if int(decode_logits.size(1)) < end:
+            raise RuntimeError("llopa_v2 decode returned too few logits for continuation scoring.")
+        return decode_logits[:, start:end, :].to(dtype=torch.float32)
+
+    def _llopa_v2_loglikelihood_inband_continuation_logits(
+        self,
+        request_str: Tuple[str, str],
+        context_enc: List[int],
+        continuation_enc: List[int],
+        *,
+        num_suffix_specials: int,
+    ) -> torch.Tensor:
+        context = request_str[0] if isinstance(request_str, (tuple, list)) and request_str else None
+        if not isinstance(context, str):
+            raise RuntimeError("llopa_v2 inband loglikelihood requires the rendered context string.")
+
+        input_token_ids = (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1]
+        if not input_token_ids:
+            raise RuntimeError("llopa_v2 inband loglikelihood built an empty model input.")
+        inplen = len(input_token_ids)
+        window_start = max(0, len(context_enc) + len(continuation_enc) - (self.max_length + 1))
+        split_start, system_len = self._infer_llopa_v2_loglikelihood_boundary(
+            context,
+            context_enc,
+            continuation_enc,
+            inplen,
+        )
+
+        global_header_starts = _infer_plain_prompt_assistant_token_starts(
+            self.tokenizer,
+            context,
+            add_bos_token=bool(self.add_bos_token),
+        )
+        local_header_starts = [
+            int(start) - int(window_start)
+            for start in global_header_starts
+            if 0 <= int(start) - int(window_start) < inplen
+        ]
+        if split_start not in local_header_starts:
+            local_header_starts.append(int(split_start))
+        local_header_starts = sorted(set(local_header_starts))
+
+        continuation_prefix_len = max(len(continuation_enc) - 1, 0)
+        prompt_token_ids = input_token_ids[: inplen - continuation_prefix_len]
+        if not prompt_token_ids:
+            raise RuntimeError("llopa_v2 inband loglikelihood built an empty prompt.")
+        local_header_starts = [
+            start for start in local_header_starts if 0 <= int(start) < len(prompt_token_ids)
+        ]
+        if split_start not in local_header_starts:
+            local_header_starts.append(int(split_start))
+        local_header_starts = sorted(set(local_header_starts))
+
+        prompt_ids = torch.tensor([prompt_token_ids], dtype=torch.long, device=self.device)
+        prompt_attention_mask = torch.ones_like(prompt_ids, dtype=torch.long, device=self.device)
+        split_starts = torch.tensor([split_start], dtype=torch.long, device=self.device)
+        system_lens = torch.tensor([system_len], dtype=torch.long, device=self.device)
+        header_starts = torch.tensor([local_header_starts], dtype=torch.long, device=self.device)
+        header_mask = torch.ones_like(header_starts, dtype=torch.bool, device=self.device)
+
+        matched_seed_fn = _get_capsule_matched_inband_seed_fn()
+        if callable(matched_seed_fn):
+            if not hasattr(self, "_shown_llopa_v2_inband_loglikelihood"):
+                print(
+                    "[Capsule] llopa_v2 inband loglikelihood matched seed enabled "
+                    f"(suffix_specials={num_suffix_specials}, assistant_headers={len(local_header_starts)})"
+                )
+                self._shown_llopa_v2_inband_loglikelihood = True
+            with torch.no_grad():
+                seed = matched_seed_fn(
+                    self.model,
+                    prompt_bundle={
+                        "prompt_ids": prompt_ids,
+                        "attention_mask": prompt_attention_mask,
+                        "prefill_lower_split_start": split_starts,
+                        "prefill_lower_system_len": system_lens,
+                        "assistant_header_starts": header_starts,
+                        "assistant_header_start_mask": header_mask,
+                    },
+                    lower_k=int(getattr(self.model, "_llopa_v2_layers", 0) or 0),
+                    prefill_attn=str(getattr(self.model, "_llopa_v2_attn", "causal") or "causal"),
+                    system_prefill=str(getattr(self.model, "_llopa_v2_system_prefill", "full") or "full"),
+                    no_upper_attn=bool(getattr(self.model, "_llopa_v2_no_upper_attn", False)),
+                )
+            if seed is not None:
+                past_key_values, _, _, first_logits = seed
+                if not isinstance(first_logits, torch.Tensor):
+                    raise RuntimeError("llopa_v2 matched inband seed did not return logits.")
+                logits_parts = [first_logits.unsqueeze(1).to(dtype=torch.float32)]
+                if continuation_prefix_len > 0:
+                    replay_module = str(getattr(self.model, "_llopa_v2_replay_module", "none") or "none")
+                    replay_per_layers = int(getattr(self.model, "_llopa_v2_replay_per_layers", -1) or -1)
+                    decode_ids = torch.tensor(
+                        [continuation_enc[:-1]],
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    with torch.no_grad():
+                        decode_outputs = self.model(
+                            input_ids=decode_ids,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            llopa_v2_decode=True,
+                            llopa_v2_decode_layers=int(getattr(self.model, "_llopa_v2_layers", 0) or 0),
+                            llopa_v2_decode_no_upper_attn=bool(
+                                getattr(self.model, "_llopa_v2_no_upper_attn", False)
+                            ),
+                            llopa_v2_decode_replay_module=replay_module,
+                            llopa_v2_decode_replay_per_layers=replay_per_layers,
+                            return_dict=True,
+                        )
+                    decode_logits = getattr(decode_outputs, "logits", None)
+                    if not isinstance(decode_logits, torch.Tensor):
+                        raise RuntimeError("llopa_v2 inband decode did not return logits.")
+                    logits_parts.append(
+                        decode_logits[:, :continuation_prefix_len, :].to(dtype=torch.float32)
+                    )
+                return torch.cat(logits_parts, dim=1)
+
+        input_ids = torch.tensor([input_token_ids], dtype=torch.long, device=self.device)
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=self.device)
+        raw_logits = self._llopa_v2_loglikelihood_call(
+            input_ids,
+            attention_mask,
+            split_starts,
+            system_lens,
+            assistant_header_starts=header_starts,
+            assistant_header_start_mask=header_mask,
+        )
+        assistant_len = int(inplen) - int(split_start) - int(continuation_prefix_len)
+        if assistant_len <= 0:
+            raise RuntimeError("llopa_v2 inband loglikelihood could not infer assistant prefix length.")
+
+        start = int(num_suffix_specials) + int(assistant_len) - 1
+        end = start + len(continuation_enc)
+        if int(raw_logits.size(1)) < end:
+            raise RuntimeError("llopa_v2 inband decode returned too few logits for continuation scoring.")
+        return raw_logits[:, start:end, :].to(dtype=torch.float32)
 
     def loglikelihood_rolling_verbose(
         self,
@@ -1241,12 +1616,51 @@ class HFLM_Verbose(HFLM):
                 self._shown_model_input = True
 
             if llopa_v2_loglikelihood:
-                raw_logits = self._llopa_v2_loglikelihood_call(
-                    batched_inps,
-                    batched_attns,
-                    torch.tensor(llopa_split_starts, device=self.device, dtype=torch.long),
-                    torch.tensor(llopa_system_lens, device=self.device, dtype=torch.long),
+                if len(chunk) != 1:
+                    raise RuntimeError(
+                        "llopa_v2 loglikelihood expects serial requests; batch_size was not forced to 1."
+                    )
+                request_str, ctx_tokens, _ = chunk[0]
+                cont_toks = cont_toks_list[0]
+                raw_logits = self._llopa_v2_loglikelihood_continuation_logits(
+                    request_str,
+                    ctx_tokens,
+                    cont_toks,
                 )
+                logits = F.log_softmax(raw_logits, dim=-1)
+                greedy_tokens = logits.argmax(dim=-1)
+
+                for request_str, cont_toks, logits in re_ord.get_cache(
+                    req_str=request_str,
+                    cxt_toks=ctx_tokens,
+                    cont_toks=cont_toks,
+                    logits=logits,
+                ):
+                    cont_toks = torch.tensor(
+                        cont_toks, dtype=torch.long, device=self.device
+                    ).unsqueeze(0)
+                    cont_toks, target_mask = self._unmask_tokens(cont_toks)
+                    max_equal = (greedy_tokens == cont_toks)[target_mask].all()
+                    logits = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(-1)
+                    answer = (float(logits[target_mask].sum()), bool(max_equal))
+
+                    verbose_answer: Dict[str, Any] = {
+                        "sum_logits": answer[0],
+                        "num_tokens": len(cont_toks[target_mask]),
+                        "num_tokens_all": len(ctx_tokens) + len(cont_toks[0]),
+                        "is_greedy": answer[1],
+                    }
+                    if verbose_token_logits:
+                        instance_tokens = [
+                            self.tok_decode(x, skip_special_tokens=False) for x in cont_toks[0]
+                        ]
+                        verbose_answer["tokens"] = instance_tokens
+                        verbose_answer["logits"] = logits[0].tolist()
+                    verbose_res.append(verbose_answer)
+
+                    self.cache_hook.add_partial("loglikelihood", request_str, answer)
+                    pbar.update(1)
+                continue
             else:
                 raw_logits = self._model_call(batched_inps, **call_kwargs)
             multi_logits = F.log_softmax(raw_logits, dim=-1)  # [batch, seq, vocab]
