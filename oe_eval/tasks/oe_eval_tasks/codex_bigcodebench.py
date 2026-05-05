@@ -8,7 +8,9 @@ code: https://github.com/bigcode-project/bigcodebench
 """
 
 import asyncio
+import math
 import os
+import random
 import tempfile
 from typing import List, Optional, Union
 
@@ -39,11 +41,14 @@ class BigCodeBench(Task):
     This is evaluating on the BigCodeBench 'full' subset.
 
     Params:
-    - split: Default: "0.1.2". refers to the HF version split for downloading the dataset.
+    - split: Default: "v0.1.2". refers to the HF version split for downloading the dataset.
     - task_config["context_kwargs"]["prompt_variant"]: Default: 'complete'. Options: [complete|instruct]
       refers to the original BigCodeBench 'split' param specifying the evaluation prompt variant.
       'complete_prompt' - Code Completion based on the structured docstrings.
       'instruct_prompt' - Code Generation based on the NL-oriented instructions.
+    - task_config["context_kwargs"]["bcb_version"]: Default: 'v0.1.2'. HF dataset split/version to use.
+    - task_config["context_kwargs"]["fixed_fewshot_from_eval_split"]: Default: False.
+      If True, fixed fewshot examples are sampled from the same BCB version split and excluded from eval docs.
 
     Applicable task_config kwargs, in addition to the global_task_args:
     - generation_kwargs: dict - Runtime overrides are directly passed to constuct_requests() as kwargs
@@ -129,6 +134,66 @@ class BigCodeBench(Task):
             raise ValueError(
                 "'instruct' prompt variant requires setting 'use_chat_format': True (or a model config w 'chat_model': True)."
             )
+        self.bcb_version = self.task_config["context_kwargs"].get(
+            "bcb_version", self.BCB_VERSION
+        )
+        self._fixed_bcb_fewshot_docs: Optional[List[dict]] = None
+
+    def _all_bcb_docs(self) -> List[dict]:
+        if self._training_docs is None:
+            self._training_docs = list(map(self._process_doc, self.dataset[self.bcb_version]))
+        return list(self._training_docs)
+
+    def _fixed_fewshot_from_eval_split(self) -> bool:
+        raw = self.task_config["context_kwargs"].get("fixed_fewshot_from_eval_split", False)
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+        return bool(raw)
+
+    def _doc_key(self, doc: dict) -> str:
+        field = self.task_config.get("native_id_field", "task_id")
+        value = doc.get(field)
+        if value in (None, ""):
+            value = doc.get("task_id")
+        return str(value)
+
+    def _fixed_fewshot_docs(self) -> List[dict]:
+        num_shots = int(self.task_config.get("num_shots", 0) or 0)
+        if num_shots <= 0:
+            return []
+        if self._fixed_bcb_fewshot_docs is None:
+            docs = self._all_bcb_docs()
+            if len(docs) < num_shots:
+                raise ValueError(
+                    f"BigCodeBench has fewer docs ({len(docs)}) than num_shots={num_shots}."
+                )
+            seed = int(self.task_config.get("fewshot_seed", 1234) or 1234)
+            self._fixed_bcb_fewshot_docs = random.Random(seed).sample(docs, num_shots)
+        return list(self._fixed_bcb_fewshot_docs)
+
+    def get_eval_docs(self, limit=None, random_subsample_seed=None):
+        if not self._fixed_fewshot_from_eval_split():
+            return super().get_eval_docs(limit=limit, random_subsample_seed=random_subsample_seed)
+        if self.task_config.get("split") != "train":
+            return super().get_eval_docs(limit=limit, random_subsample_seed=random_subsample_seed)
+
+        fewshot_keys = {self._doc_key(doc) for doc in self._fixed_fewshot_docs()}
+        docs = [doc for doc in self._all_bcb_docs() if self._doc_key(doc) not in fewshot_keys]
+
+        if limit is not None and isinstance(limit, float):
+            limit = math.ceil(len(docs) * limit)
+        if limit is not None and len(docs) > limit:
+            docs = (
+                docs[:limit]
+                if random_subsample_seed is None
+                else random.Random(random_subsample_seed).sample(docs, limit)
+            )
+        return docs
+
+    def fewshot_examples(self, k, rnd, doc):
+        if self._fixed_fewshot_from_eval_split():
+            return self._fixed_fewshot_docs()[:k]
+        return super().fewshot_examples(k, rnd, doc)
 
     def make_metrics(self):
         api_type = self.task_config["metric_kwargs"].get("api_type", "lambda")
@@ -163,7 +228,7 @@ class BigCodeBench(Task):
         return False
 
     def training_docs(self):
-        return list(map(self._process_doc, self.dataset[self.BCB_VERSION]))
+        return self._all_bcb_docs()
 
     def validation_docs(self):
         return []

@@ -77,6 +77,16 @@ EXPLICIT_ASSISTANT_HEADER_MARKERS = (
 )
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
 def _normalize_fusion_mode(mode: Any) -> str:
     normalized = str(mode or "auto").strip().lower().replace("-", "_")
     if normalized in {"", "auto"}:
@@ -1893,6 +1903,27 @@ class HFLM_Verbose(HFLM):
                 self.cache_hook.add_partial(
                     "generate_until", (context, request_gen_kwargs), s
                 )
+                preview_chars = _env_int("OE_EVAL_PREDICT_PREVIEW_CHARS", 0)
+                if preview_chars > 0 and self.rank == 0:
+                    request_idx = pbar.n + 1
+                    preview_first = _env_int("OE_EVAL_PREDICT_PREVIEW_FIRST", 0)
+                    preview_every = _env_int("OE_EVAL_PREDICT_PREVIEW_EVERY", 0)
+                    should_preview = request_idx <= preview_first or (
+                        preview_every > 0 and request_idx % preview_every == 0
+                    )
+                    if should_preview:
+                        preview_text = (s or s_raw or "")[:preview_chars]
+                        preview_text = preview_text.replace("\n", "\\n")
+                        eval_logger.info(
+                            "[predict_preview] request=%d tokens=%d chars=%d raw_chars=%d "
+                            "hit_stop=%s preview=%r",
+                            request_idx,
+                            len(cont_toks_no_pad),
+                            len(s or ""),
+                            len(s_raw or ""),
+                            bool(s_raw != s),
+                            preview_text,
+                        )
                 pbar.update(1)
 
         for chunk in chunks:

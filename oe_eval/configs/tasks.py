@@ -6295,6 +6295,30 @@ TASK_CONFIGS.update(
                 "regimes": ["Tulu"],
             },
         },
+        "bigcodebench:v0.1.4::tulu": {
+            "task_name": "bigcodebench",
+            "primary_metric": "pass_at_10",
+            "use_chat_format": True,
+            "context_kwargs": {
+                "prompt_variant": "instruct",
+                "bcb_version": "v0.1.4",
+                "fixed_fewshot_from_eval_split": True,
+            },
+            "generation_kwargs": {
+                "max_gen_toks": 999999,  # arbitrary big num to allow more tokens for thinking
+                "truncate_context": False,
+                "do_sample": True,
+                "top_p": 0.95,
+                "temperature": 0.8,
+                "repeats": 20,
+            },
+            "metric_kwargs": {
+                "pass_at_ks": [1, 10],
+            },
+            "metadata": {
+                "regimes": ["Tulu"],
+            },
+        },
         "bigcodebench_hard::tulu": {
             "task_name": "bigcodebench_hard",
             "use_chat_format": True,
